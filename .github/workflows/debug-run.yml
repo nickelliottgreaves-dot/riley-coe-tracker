@@ -1,0 +1,34 @@
+name: Debug Riley & Coe Actions
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Print environment
+        run: |
+          echo "Workflow run for repo: $GITHUB_REPOSITORY"
+          echo "Actor: $GITHUB_ACTOR"
+          echo "Run ID: $GITHUB_RUN_ID"
+          echo "Ref: $GITHUB_REF"
+
+      - name: List repository files
+        run: |
+          ls -la
+          echo '---'
+          pwd
+
+      - name: Show Python
+        run: |
+          python3 --version || true
+          which python3 || true
