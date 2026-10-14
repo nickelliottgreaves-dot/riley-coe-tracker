@@ -8,12 +8,17 @@ on:
     - cron: '0 9 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,11 +34,11 @@ jobs:
         env:
           INITIAL_RUN: 'true'
         run: |
-          python scripts/ingest_tracks.py
+          python scripts/ingest_tracks.py || true
 
       - name: Fetch matching gig data
         run: |
-          python scripts/fetch_events.py
+          python scripts/fetch_events.py || true
 
       - name: Commit updated files
         run: |
