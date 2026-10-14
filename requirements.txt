@@ -1,3 +1,6 @@
 # Python dependencies
 requests
 beautifulsoup4
+python-dateutil
+pytest
+playwright

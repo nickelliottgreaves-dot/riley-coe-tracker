@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main ]
   schedule:
-    # Monday 09:00 GMT
     - cron: '0 9 * * 1'
   workflow_dispatch:
 
@@ -30,55 +29,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Add artist pool from Riley & Coe episodes (best-effort, no secrets required)
-        env:
-          INITIAL_RUN: 'true'
+      - name: Install Playwright browsers
         run: |
-          python scripts/ingest_tracks.py || true
+          python -m playwright install --with-deps
 
-      - name: Fetch matching gig data
+      - name: Run BBC ingest (with diagnostics)
         run: |
-          python scripts/fetch_events.py || true
+          python scripts/ingest_tracks.py
 
-      - name: Commit updated files
+      - name: Run RadioFiles collector
         run: |
-          git config user.name "riley-coe-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add artists.json matches/ || true
-          if ! git diff --cached --quiet; then
-            git commit -m "Update artists and matches"
-            git push
-          else
-            echo "No changes to commit"
-          fi
+          python scripts/collect_radiofiles.py
 
-      - name: Create issue summary if matches exist
-        uses: actions/github-script@v7
+      - name: Run Mixcloud collector
+        run: |
+          python scripts/collect_mixcloud.py
+
+      - name: Generate coverage report
+        run: |
+          python scripts/generate_coverage_report.py
+
+      - name: Upload diagnostics as artifact
+        uses: actions/upload-artifact@v4
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const path = 'matches/' + new Date().toISOString().slice(0,10) + '.json';
-            if (!fs.existsSync(path)) {
-              console.log('No matches file found yet for today: ' + path);
-              return;
-            }
-            const matches = JSON.parse(fs.readFileSync(path, 'utf8'));
-            if (!Array.isArray(matches) || matches.length === 0) {
-              console.log('No matches to publish');
-              return;
-            }
-            const lines = ['# Riley & Coe weekly matches', '', '## Matches found', ''];
-            for (const m of matches) {
-              const date = m.date || 'TBA';
-              const price = m.price || 'N/A';
-              const url = m.url ? `([link](${m.url}))` : '';
-              lines.push(`- ${date} | ${m.artist} | ${m.venue} | ${price} ${url}`);
-            }
-            lines.push('', 'The detailed report is stored in `matches/' + new Date().toISOString().slice(0,10) + '.json`');
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Riley & Coe matches for ${new Date().toISOString().slice(0,10)}`,
-              body: lines.join('\n')
-            });
+          name: riley-coe-diagnostics
+          path: |
+            diagnostics/**
+            outputs/**
+            reports/**

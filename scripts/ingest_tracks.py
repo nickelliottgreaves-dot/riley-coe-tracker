@@ -1,155 +1,173 @@
 #!/usr/bin/env python3
-"""
-Robust ingest_tracks.py
-- Uses requests with retry/backoff
-- Defensive parsing
-- Never raises uncaught exceptions (prints errors and exits 0)
+"""Ingest Riley & Coe episodes from BBC Sounds with diagnostics and Playwright rendering when needed.
+Saves raw HTML and application/ld+json blocks for inspection and writes extracted tracklists to outputs/bbc_tracks.json
 """
 import os
 import re
 import json
-import time
-from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from datetime import datetime
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-ARTISTS_FILE = os.path.join(REPO_ROOT, 'artists.json')
-HEADERS = {'User-Agent': 'riley-coe-tracker/1.0 (+https://github.com/nickelliottgreaves-dot/riley-coe-tracker)'}
-BBC_SEARCH_URL = 'https://www.bbc.co.uk/search?q=Riley+and+Coe+6+Music+tracklist'
+DIAG_DIR = 'diagnostics/raw'
+OUT_DIR = 'outputs'
+BBC_PROGRAMME = os.environ.get('BBC_PROGRAMME', 'https://www.bbc.co.uk/programmes/b00cfv7b')
+MAX_EPISODES = 10
 
-
-def requests_session(retries=3, backoff_factor=0.5, status_forcelist=(500, 502, 503, 504)):
-    s = requests.Session()
-    retry = Retry(total=retries, read=retries, connect=retries, backoff_factor=backoff_factor,
-                  status_forcelist=status_forcelist, allowed_methods=frozenset(['GET', 'POST']))
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount('https://', adapter)
-    s.mount('http://', adapter)
-    return s
+os.makedirs(DIAG_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
 
 
-def load_artists():
+def save(path, content):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+
+def fetch_url(url):
     try:
-        with open(ARTISTS_FILE, 'r', encoding='utf-8') as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-
-def save_artists(artists):
-    try:
-        with open(ARTISTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(sorted(list(artists)), f, ensure_ascii=False, indent=2)
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        return resp.text
     except Exception as e:
-        print('Failed to save artists.json:', e)
+        print(f"Failed to fetch {url}: {e}")
+        return None
 
 
-def find_episode_links(session):
+def extract_json_ld(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    jsonld = []
+    for tag in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(tag.string)
+            jsonld.append(data)
+        except Exception:
+            # sometimes JS comments or non-JSON; skip
+            continue
+    return jsonld
+
+
+def parse_tracklist_from_html(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    # Look for ordered/ul lists that might be tracklists
+    candidates = []
+    for sel in ['ol.tracklist', 'ul.tracklist', 'ol', 'ul', 'div.tracklist', 'section.tracklist']:
+        for el in soup.select(sel):
+            items = [li.get_text(separator=' ', strip=True) for li in el.find_all('li')]
+            if len(items) >= 3:
+                candidates.append(items)
+    # Heuristic: return the longest candidate
+    if candidates:
+        candidates.sort(key=len, reverse=True)
+        return candidates[0]
+    # Fallback: look for numbered lines in paragraphs
+    text = soup.get_text('\n')
+    numbered = re.findall(r"^\s*\d+[\).\-]\s*(.+)$", text, flags=re.M)
+    if numbered:
+        return [s.strip() for s in numbered]
+    return []
+
+
+def render_with_playwright(url):
+    # Use Playwright to render page and expand 'Show more' if present.
     try:
-        r = session.get(BBC_SEARCH_URL, headers=HEADERS, timeout=15)
-        r.raise_for_status()
+        from playwright.sync_api import sync_playwright
     except Exception as e:
-        print('BBC search fetch failed:', e)
+        print('Playwright not available:', e)
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=30000)
+            # try to click any "Show more"/"More" buttons
+            for txt in ['Show more', 'Show More', 'More', 'Show full', 'Show all']:
+                try:
+                    btn = page.query_selector(f"button:has-text('{txt}')")
+                    if btn:
+                        btn.click()
+                except Exception:
+                    pass
+            # Wait a moment for dynamic content
+            page.wait_for_timeout(800)
+            html = page.content()
+            browser.close()
+            return html
+    except Exception as e:
+        print('Playwright render failed for', url, e)
+        return None
+
+
+def collect_bbc():
+    print('Collecting BBC programme pages from', BBC_PROGRAMME)
+    pg = fetch_url(BBC_PROGRAMME)
+    if not pg:
+        print('Failed to fetch programme page')
         return []
-    soup = BeautifulSoup(r.text, 'html.parser')
-    links = []
+    soup = BeautifulSoup(pg, 'html.parser')
+    # Find episode links (href containing /programmes/ and a date-like context)
+    anchors = []
     for a in soup.find_all('a', href=True):
         href = a['href']
-        text = a.get_text(' ', strip=True).lower()
-        try:
-            if '/programmes/' in href and ('riley' in text or 'coe' in text):
-                links.append(href)
-        except Exception:
+        if '/programmes/' in href and 'episodes' in href or re.search(r'/programmes/[a-z0-9]+/episodes', href):
+            full = href if href.startswith('http') else 'https://www.bbc.co.uk' + href
+            anchors.append(full)
+    # dedupe preserving order
+    seen = set()
+    episodes = []
+    for u in anchors:
+        if u in seen:
             continue
-    return list(dict.fromkeys(links))
-
-
-def extract_artists_from_page(session, url):
-    try:
-        r = session.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-    except Exception as e:
-        print('Fetch failed for', url, e)
-        return []
-    try:
-        soup = BeautifulSoup(r.text, 'html.parser')
-        # Try to find structured tracklist (ol/ul with class or id)
-        candidates = []
-        for selector in ['ol.tracklist', 'ul.tracklist', 'section.tracklist', 'div.tracklist', 'div.programme__body']:
-            for node in soup.select(selector):
-                text = node.get_text('\n')
-                for line in text.split('\n'):
-                    s = line.strip()
-                    if not s:
-                        continue
-                    candidates.append(s)
-        # Fallback: full page text
-        if not candidates:
-            text = soup.get_text('\n')
-            candidates = [line.strip() for line in text.split('\n') if line.strip()]
-
-        parsed = []
-        for line in candidates:
-            s = line
-            # strip leading numbers
-            s = re.sub(r'^\s*[0-9]+\.?\s*', '', s)
-            # split on dash or long dash
-            s = re.split(r'\s[\-\u2013\u2014:\/]\s', s)[0]
-            s = s.strip(' "\'[]()*/')
-            if 2 < len(s) < 120 and not s.lower().startswith(('listen', 'more', 'tracklisting', 'full tracklist')):
-                parsed.append(s)
-        # dedupe preserving order
-        seen = set()
-        out = []
-        for p in parsed:
-            if p not in seen:
-                seen.add(p)
-                out.append(p)
-        return out
-    except Exception as e:
-        print('Error parsing', url, e)
-        return []
-
-
-def main():
-    try:
-        initial_run = os.getenv('INITIAL_RUN', 'false').lower() in {'1', 'true', 'yes'}
-        print('Running ingest_tracks.py; initial_run=', initial_run)
-        session = requests_session()
-        existing = load_artists()
-        links = find_episode_links(session)
-        print('Found candidate episode links:', len(links))
-        discovered = []
-        for url in links:
-            try:
-                artists = extract_artists_from_page(session, url)
-                for a in artists:
-                    discovered.append(a)
-                # be polite
-                time.sleep(0.5)
-            except Exception as e:
-                print('Error processing', url, e)
-                continue
-        discovered_set = set(discovered)
-        new = sorted(a for a in discovered_set if a not in existing)
-        if new:
-            for item in new:
-                existing.add(item)
-            save_artists(existing)
-            try:
-                with open(os.path.join(REPO_ROOT, 'new_artists.txt'), 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(new))
-            except Exception as e:
-                print('Failed to write new_artists.txt', e)
-            print('New artists:', len(new))
+        seen.add(u)
+        episodes.append(u)
+        if len(episodes) >= MAX_EPISODES:
+            break
+    results = []
+    for idx, ep in enumerate(episodes, 1):
+        print(f'Processing episode {idx}/{len(episodes)}: {ep}')
+        html = fetch_url(ep)
+        if html:
+            name = f'bbc_ep_{idx}.html'
+            save(os.path.join(DIAG_DIR, name), html)
+            jsonld = extract_json_ld(html)
+            if jsonld:
+                save(os.path.join(DIAG_DIR, f'bbc_ep_{idx}_jsonld.json'), json.dumps(jsonld, indent=2))
+            tracks = []
+            # Try JSON-LD
+            for entry in jsonld:
+                # many schemas use "track" or "trackList"
+                if isinstance(entry, dict):
+                    for key in ('track', 'trackList', 'tracks', 'hasPart'):
+                        if key in entry:
+                            candidate = entry[key]
+                            # candidate can be list of objects or strings
+                            if isinstance(candidate, list):
+                                for it in candidate:
+                                    if isinstance(it, dict):
+                                        t = it.get('name') or it.get('headline') or it.get('item')
+                                        if t:
+                                            tracks.append(t)
+                                    elif isinstance(it, str):
+                                        tracks.append(it)
+            if not tracks:
+                # Try static HTML parsing
+                tracks = parse_tracklist_from_html(html)
+            if not tracks:
+                # Render with Playwright as last resort
+                print('No tracks found in static HTML/JSON-LD, trying Playwright render')
+                rendered = render_with_playwright(ep)
+                if rendered:
+                    save(os.path.join(DIAG_DIR, f'bbc_ep_{idx}_rendered.html'), rendered)
+                    tracks = parse_tracklist_from_html(rendered)
+            status = 'complete' if tracks else 'failed'
+            results.append({'url': ep, 'tracks': tracks, 'status': status})
         else:
-            print('No new artists discovered')
-    except Exception as e:
-        print('Unexpected error in ingest_tracks:', e)
+            results.append({'url': ep, 'tracks': [], 'status': 'failed'})
+    out_path = os.path.join(OUT_DIR, 'bbc_tracks.json')
+    save(out_path, json.dumps(results, indent=2, ensure_ascii=False))
+    print('Saved BBC tracks to', out_path)
+    return results
 
 
 if __name__ == '__main__':
-    main()
+    out = collect_bbc()
+    print('BBC collection complete. Episodes:', len(out))
