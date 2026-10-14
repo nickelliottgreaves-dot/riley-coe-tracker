@@ -1,6 +1,3 @@
 # Python dependencies
 requests
 beautifulsoup4
-python-dateutil
-musicbrainzngs
-rapidfuzz
